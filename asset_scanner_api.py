@@ -2,6 +2,7 @@ import os
 import sys
 import nmap
 import pymongo
+from flask_cors import CORS 
 from flask_restful import Api, Resource
 from flask import request, Flask, jsonify
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ from pymongo.errors import ServerSelectionTimeoutError
 
 
 app = Flask(__name__)
+CORS(app)
 api = Api(app)
 
 class BaseAssetProcessor(Resource):
@@ -27,7 +29,44 @@ class BaseAssetProcessor(Resource):
         self.collection = self.db["assets"]
         self.scan_enabled = scan_enabled
 
+
     def process_assets(self, ip_list):
+        if ip_list:
+            # If IP list is not empty, delete existing data from the collection
+            self.collection.delete_many({})
+            
+        def generate_results():
+
+            with ThreadPoolExecutor() as executor:
+                futures = [executor.submit(self.detect, ip) for ip in ip_list]
+
+                for i, future in enumerate(futures, start=1):
+                    ip = ip_list[i - 1]
+                    mac, detected_os = future.result()
+
+                    # Construct the result dictionary
+                    result = {"IP": ip, "MAC": mac, "OS": detected_os}
+
+                    # Optionally add a "Status" field if needed
+                    if self.scan_enabled:
+                        try:
+                            self.collection.insert_one(result)
+                            result["Status"] = "Success"
+                        except Exception as e:
+                            print(f"Error inserting result into MongoDB: {e}")
+                            result["Status"] = "Failed"
+
+                    yield result  # Yield the result as a JSON string
+
+        # Return a generator for streaming results
+        return generate_results()
+
+    def process_assets_old(self, ip_list):
+
+        if ip_list:
+            # If IP list is not empty, delete existing data from the collection
+            self.collection.delete_many({})
+            
         scan_results = []
 
         with ThreadPoolExecutor() as executor:
@@ -55,8 +94,24 @@ class BaseAssetProcessor(Resource):
 
 
 class AssetScanner(BaseAssetProcessor):
-
     def get(self):
+        ip_cidr = request.args.get('ip_cidr')
+
+        if os.geteuid() != 0:
+            print('You need to be root to run this script', file=sys.stderr)
+            sys.exit(1)
+
+        ip_list = self.discover_assets(ip_cidr)
+
+        # Send the IP list first as a JSON response
+        response = {'ip_list': ip_list}
+        yield jsonify(response)
+
+        # Stream individual results as they become available
+        for result in self.process_assets(ip_list):
+            yield jsonify(result)
+
+    def get_old(self):
         ip_cidr = request.args.get('ip_cidr')
 
         if os.geteuid() != 0:
